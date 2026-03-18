@@ -1,214 +1,246 @@
-import torch, os, sys, torchvision, argparse
-import time, math
-import numpy as np
-from torch.backends import cudnn
-from torch import optim
-import torch, warnings
-from torch import nn
-from option import opt, log_dir
-import matplotlib.pyplot as plt
-from torchvision.utils import make_grid
-
-from metrics import psnr, ssim
-from models.AECRNet import *
-from models.CR import *
-from data_utils.ITS_h5 import ITS_train_loader
-from data_utils.ITS_h5 import ITS_test_loader
-from data_utils.NH import *
-from data_utils.DH import *
-
 import json
+import math
+import os
+import time
+import warnings
+
+import numpy as np
+import torch
+from torch import nn, optim
+from torch.backends import cudnn
+from torch.utils.data import DataLoader
+
+from option import opt, log_dir
+from metrics import psnr, ssim
+from models.AECRNet import Dehaze
+from models.CR import ContrastLoss
+from data_utils.NH_png import NH_PNG_Dataset
+
+warnings.filterwarnings("ignore")
 
 
-warnings.filterwarnings('ignore')
-
-models_={
-	'cdnet': Dehaze(3, 3),
-}
-
-loaders_={
-	'ITS_train': ITS_train_loader,
-	'ITS_test': ITS_test_loader,
-	'NH_train': NH_train_loader,
-	'NH_test': NH_test_loader,
-	'DH_train': DH_train_loader,
-	'DH_test': DH_test_loader,
-}
-
-start_time = time.time()
-start_time = time.time()
-model_name = opt.model_name
-steps = opt.eval_step * opt.epochs
-T = steps
-
-def lr_schedule_cosdecay(t,T,init_lr=opt.lr):
-	lr = 0.5 * (1 + math.cos(t * math.pi / T)) * init_lr
-	return lr
+def lr_schedule_cosdecay(t, total_steps, init_lr=opt.lr):
+    return 0.5 * (1 + math.cos(t * math.pi / total_steps)) * init_lr
 
 
-def train(net, loader_train, loader_test, optim, criterion):
-	losses = []
-	start_step = 0
-	max_ssim = 0
-	max_psnr = 0
-	ssims = []
-	psnrs = []
+def unwrap_output(model_output):
+    # Legacy checkpoints/scripts may return tuples. AECR-Net returns a tensor.
+    if isinstance(model_output, (tuple, list)):
+        return model_output[0]
+    return model_output
 
-	print(os.path.exists(opt.model_dir))
-	if opt.resume and os.path.exists(opt.model_dir):
-		if opt.pre_model != 'null':
-			ckp = torch.load('./trained_models/'+opt.pre_model)
-		else:
-			ckp = torch.load(opt.model_dir)
 
-		print(f'resume from {opt.model_dir}')
-		losses = ckp['losses']
-		net.load_state_dict(ckp['model'])
-		optim.load_state_dict(ckp['optimizer'])
-		start_step = ckp['step']
-		max_ssim = ckp['max_ssim']
-		max_psnr = ckp['max_psnr']
-		psnrs = ckp['psnrs']
-		ssims = ckp['ssims']
-		print(f'max_psnr: {max_psnr} max_ssim: {max_ssim}')
-		print(f'start_step:{start_step} start training ---')
-	else:
-		print('train from scratch *** ')
+def build_loader_registry():
+    loaders = {}
 
-	for step in range(start_step+1, steps+1):
-		net.train()
-		lr = opt.lr
-		if not opt.no_lr_sche:
-			lr = lr_schedule_cosdecay(step,T)
-			for param_group in optim.param_groups:
-				param_group["lr"] = lr
+    try:
+        from data_utils.ITS_h5 import ITS_train_loader, ITS_test_loader
+        from data_utils.NH import NH_train_loader, NH_test_loader
+        from data_utils.DH import DH_train_loader, DH_test_loader
 
-		x, y = next(iter(loader_train)) # [x, y] 10:10
-		x = x.to(opt.device)
-		y = y.to(opt.device)
+        loaders.update(
+            {
+                "ITS_train": ITS_train_loader,
+                "ITS_test": ITS_test_loader,
+                "NH_train": NH_train_loader,
+                "NH_test": NH_test_loader,
+                "DH_train": DH_train_loader,
+                "DH_test": DH_test_loader,
+            }
+        )
+    except Exception as e:
+        if opt.runtime_mode == "legacy":
+            raise
+        print(f"[compat] H5 loaders unavailable: {e}")
 
-		out, _, m4, m5 = net(x)
+    if opt.runtime_mode == "compat":
+        train_size = opt.crop_size if opt.crop else "whole_img"
+        nh_png_train = NH_PNG_Dataset(opt.nh_png_root, train=True, size=train_size)
+        nh_png_test = NH_PNG_Dataset(opt.nh_png_root, train=False, size="whole_img")
+        loaders["NH_PNG_train"] = DataLoader(dataset=nh_png_train, batch_size=opt.bs, shuffle=True)
+        loaders["NH_PNG_test"] = DataLoader(dataset=nh_png_test, batch_size=1, shuffle=False)
+        loaders["NH_PNG"] = loaders["NH_PNG_test"]
 
-		loss_vgg7, all_ap, all_an, loss_rec = 0, 0, 0, 0
-		if opt.w_loss_l1 > 0:
-			loss_rec = criterion[0](out, y)
-		if opt.w_loss_vgg7 > 0:
-			loss_vgg7, all_ap, all_an = criterion[1](out, y, x)
+    return loaders
 
-		loss = opt.w_loss_l1*loss_rec + opt.w_loss_vgg7*loss_vgg7
-		loss.backward()
-		
-		optim.step()
-		optim.zero_grad()
-		losses.append(loss.item())
 
-		print(f'\rloss:{loss.item():.5f} l1:{opt.w_loss_l1*loss_rec:.5f} contrast: {opt.w_loss_vgg7*loss_vgg7:.5f} all_ap:{all_ap:.5f} all_an:{all_an:.5f}| step :{step}/{steps}|lr :{lr :.7f} |time_used :{(time.time() - start_time) / 60 :.1f}',end='', flush=True)
+def test(net, loader_test):
+    net.eval()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-		# with SummaryWriter(logdir=log_dir, comment=log_dir) as writer:
-		# 		# 	writer.add_scalar('data/loss', loss, step)
-		# 		# 	writer.add_scalar('data/loss_l1', loss_rec, step)
-		# 		# 	writer.add_scalar('data/loss_vgg4', loss_vgg4, step)
-		# 		# 	writer.add_scalar('data/all_ap', all_ap, step)
-		# 		# 	writer.add_scalar('data/all_an', all_an, step)
-		# 		# 	writer.add_scalar('data/m1', m1, step)
+    ssims, psnrs = [], []
+    for inputs, targets in loader_test:
+        inputs = inputs.to(opt.device)
+        targets = targets.to(opt.device)
+        with torch.no_grad():
+            pred = unwrap_output(net(inputs))
+        ssims.append(ssim(pred, targets).item())
+        psnrs.append(psnr(pred, targets))
+    return float(np.mean(ssims)), float(np.mean(psnrs))
 
-		if step % opt.eval_step == 0:
-			epoch = int(step / opt.eval_step)
 
-			save_model_dir = opt.model_dir
-			with torch.no_grad():
-				ssim_eval, psnr_eval = test(net, loader_test, max_psnr, max_ssim, step)
+def train(net, loader_train, loader_test, optimizer, criterion_l1, criterion_contrast):
+    losses = []
+    ssims = []
+    psnrs = []
+    start_step = 0
+    max_ssim = 0.0
+    max_psnr = 0.0
+    total_steps = opt.eval_step * opt.epochs
+    start_time = time.time()
+    log_file = os.path.join(log_dir, "train.log")
 
-			log = f'\nstep :{step} | epoch: {epoch} | ssim:{ssim_eval:.4f}| psnr:{psnr_eval:.4f}'
+    if opt.resume and os.path.exists(opt.model_dir):
+        ckp_path = os.path.join("./trained_models", opt.pre_model) if opt.pre_model != "null" else opt.model_dir
+        ckp = torch.load(ckp_path, map_location=opt.device)
+        net.load_state_dict(ckp["model"])
+        optimizer.load_state_dict(ckp["optimizer"])
+        losses = ckp.get("losses", [])
+        start_step = ckp.get("step", 0)
+        max_ssim = ckp.get("max_ssim", 0.0)
+        max_psnr = ckp.get("max_psnr", 0.0)
+        ssims = ckp.get("ssims", [])
+        psnrs = ckp.get("psnrs", [])
+        print(f"resume from {ckp_path}")
+    else:
+        print("train from scratch")
 
-			print(log)
-			with open(f'./logs_train/{opt.model_name}.txt', 'a') as f:
-				f.write(log + '\n')
+    train_iter = iter(loader_train)
+    for step in range(start_step + 1, total_steps + 1):
+        net.train()
+        if not opt.no_lr_sche:
+            lr = lr_schedule_cosdecay(step, total_steps)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+        else:
+            lr = opt.lr
 
-			ssims.append(ssim_eval)
-			psnrs.append(psnr_eval)
+        try:
+            x, y = next(train_iter)
+        except StopIteration:
+            train_iter = iter(loader_train)
+            x, y = next(train_iter)
 
-			if psnr_eval > max_psnr:
-				max_ssim = max(max_ssim, ssim_eval)
-				max_psnr = max(max_psnr, psnr_eval)
-				save_model_dir = opt.model_dir + '.best'
-				print(
-					f'\n model saved at step :{step}| epoch: {epoch} | max_psnr:{max_psnr:.4f}| max_ssim:{max_ssim:.4f}')
+        x = x.to(opt.device)
+        y = y.to(opt.device)
+        out = unwrap_output(net(x))
 
-			torch.save({
-				'epoch': epoch,
-				'step': step,
-				'max_psnr': max_psnr,
-				'max_ssim': max_ssim,
-				'ssims': ssims,
-				'psnrs': psnrs,
-				'losses': losses,
-				'model': net.state_dict(),
-				'optimizer': optim.state_dict()
-			}, save_model_dir)
+        loss_rec = criterion_l1(out, y) if opt.w_loss_l1 > 0 else torch.tensor(0.0, device=opt.device)
+        loss_vgg7 = (
+            criterion_contrast(out, y, x)
+            if (criterion_contrast is not None and opt.w_loss_vgg7 > 0)
+            else torch.tensor(0.0, device=opt.device)
+        )
+        loss = opt.w_loss_l1 * loss_rec + opt.w_loss_vgg7 * loss_vgg7
 
-	np.save(f'./numpy_files/{model_name}_{steps}_losses.npy', losses)
-	np.save(f'./numpy_files/{model_name}_{steps}_ssims.npy', ssims)
-	np.save(f'./numpy_files/{model_name}_{steps}_psnrs.npy', psnrs)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        losses.append(loss.item())
 
-def test(net,loader_test):
-	net.eval()
-	torch.cuda.empty_cache()
-	ssims = []
-	psnrs = []
+        print(
+            f"\rloss:{loss.item():.5f} l1:{(opt.w_loss_l1 * loss_rec):.5f} "
+            f"contrast:{(opt.w_loss_vgg7 * loss_vgg7):.5f} "
+            f"| step:{step}/{total_steps} | lr:{lr:.7f} "
+            f"| time_used:{(time.time() - start_time)/60:.1f}m",
+            end="",
+            flush=True,
+        )
 
-	for i, (inputs, targets) in enumerate(loader_test):
-		inputs = inputs.to(opt.device);targets = targets.to(opt.device)
-		with torch.no_grad():
-			pred, _, _, _ = net(inputs)
+        if step % opt.eval_step == 0:
+            epoch = int(step / opt.eval_step)
+            ssim_eval, psnr_eval = test(net, loader_test)
+            ssims.append(ssim_eval)
+            psnrs.append(psnr_eval)
 
-		ssim1 = ssim(pred, targets).item()
-		psnr1 = psnr(pred, targets)
-		ssims.append(ssim1)
-		psnrs.append(psnr1)
+            log_line = f"\nstep:{step} | epoch:{epoch} | ssim:{ssim_eval:.4f} | psnr:{psnr_eval:.4f}"
+            print(log_line)
+            with open(log_file, "a") as f:
+                f.write(log_line + "\n")
 
-	return np.mean(ssims), np.mean(psnrs)
+            save_model_dir = opt.model_dir
+            if psnr_eval > max_psnr:
+                max_ssim = max(max_ssim, ssim_eval)
+                max_psnr = max(max_psnr, psnr_eval)
+                save_model_dir = opt.model_dir + ".best"
+                print(f"best update -> psnr:{max_psnr:.4f}, ssim:{max_ssim:.4f}")
+
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "step": step,
+                    "max_psnr": max_psnr,
+                    "max_ssim": max_ssim,
+                    "ssims": ssims,
+                    "psnrs": psnrs,
+                    "losses": losses,
+                    "model": net.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "runtime_mode": opt.runtime_mode,
+                },
+                save_model_dir,
+            )
+
+    np.save(f"./numpy_files/{opt.model_name}_{total_steps}_losses.npy", losses)
+    np.save(f"./numpy_files/{opt.model_name}_{total_steps}_ssims.npy", ssims)
+    np.save(f"./numpy_files/{opt.model_name}_{total_steps}_psnrs.npy", psnrs)
+
 
 def set_seed_torch(seed=2018):
-	os.environ['PYTHONHASHSEED'] = str(seed)
-	np.random.seed(seed)
-	np.random.seed(seed)
-	torch.manual_seed(seed)
-	torch.cuda.manual_seed(seed)
-	torch.backends.cudnn.deterministic = True
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
 
 if __name__ == "__main__":
+    set_seed_torch(666)
+    os.makedirs(log_dir, exist_ok=True)
 
-	set_seed_torch(666)
+    with open(os.path.join(log_dir, "args.json"), "w") as f:
+        json.dump(opt.__dict__, f, indent=2)
 
-	if not opt.resume and os.path.exists(f'./logs_train/{opt.model_name}.txt'):
-		print(f'./logs_train/{opt.model_name}.txt 已存在，请删除该文件……')
-		exit()
+    loader_registry = build_loader_registry()
+    if (
+        opt.runtime_mode == "compat"
+        and opt.trainset == "NH_train"
+        and opt.testset == "NH_test"
+        and "NH_train" not in loader_registry
+    ):
+        print("[compat] Falling back to NH_PNG loaders because H5 NH loaders are unavailable.")
+        opt.trainset = "NH_PNG_train"
+        opt.testset = "NH_PNG_test"
 
-	with open(f'./logs_train/args_{opt.model_name}.txt', 'w') as f:
-		json.dump(opt.__dict__, f, indent=2)
+    if opt.trainset not in loader_registry or opt.testset not in loader_registry:
+        raise KeyError(
+            f"Unknown loader key(s): trainset={opt.trainset}, testset={opt.testset}. "
+            f"Available: {sorted(loader_registry.keys())}"
+        )
 
-	loader_train = loaders_[opt.trainset]
-	loader_test = loaders_[opt.testset]
-	net = models_[opt.net]
-	net = net.to(opt.device)
-	epoch_size = len(loader_train)
-	print("epoch_size: ", epoch_size)
-	if opt.device == 'cuda':
-		net = torch.nn.DataParallel(net)
-		cudnn.benchmark = True
+    loader_train = loader_registry[opt.trainset]
+    loader_test = loader_registry[opt.testset]
+    net = Dehaze(3, 3).to(opt.device)
 
-	pytorch_total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-	print("Total_params: ==> {}".format(pytorch_total_params))
+    if opt.device == "cuda":
+        net = torch.nn.DataParallel(net)
+        cudnn.benchmark = True
 
-	criterion = []
-	criterion.append(nn.L1Loss().to(opt.device))
-	criterion.append(ContrastLoss(ablation=opt.is_ab))
+    print("epoch_size:", len(loader_train))
+    print("Total_params:", sum(p.numel() for p in net.parameters() if p.requires_grad))
+    print(f"runtime_mode: {opt.runtime_mode}")
 
+    criterion_l1 = nn.L1Loss().to(opt.device)
+    criterion_contrast = None
+    if opt.w_loss_vgg7 > 0:
+        criterion_contrast = ContrastLoss(ablation=opt.is_ab, force_legacy_cuda=(opt.runtime_mode == "legacy"))
 
-
-	optimizer = optim.Adam(params=filter(lambda x: x.requires_grad, net.parameters()), lr=opt.lr, betas = (0.9, 0.999), eps=1e-08)
-	optimizer.zero_grad()
-	train(net, loader_train, loader_test, optimizer, criterion)
-	
-
+    optimizer = optim.Adam(
+        params=filter(lambda x: x.requires_grad, net.parameters()),
+        lr=opt.lr,
+        betas=(0.9, 0.999),
+        eps=1e-08,
+    )
+    optimizer.zero_grad()
+    train(net, loader_train, loader_test, optimizer, criterion_l1, criterion_contrast)

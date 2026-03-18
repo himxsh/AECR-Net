@@ -5,14 +5,18 @@ warnings.filterwarnings('ignore')
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--device', type=str,default='Automatic detection')
+parser.add_argument('--runtime_mode', type=str, default='compat', choices=['legacy', 'compat'])
 parser.add_argument('--resume', type=bool,default=False)
 parser.add_argument('--epochs', type=int,default=100)
 parser.add_argument('--eval_step', type=int,default=5000)
 parser.add_argument('--lr', default=0.0001, type=float, help='learning rate')
 parser.add_argument('--model_dir', type=str,default='./trained_models/')
-parser.add_argument('--trainset', type=str,default='its_train')
-parser.add_argument('--testset', type=str,default='its_test')
-parser.add_argument('--net', type=str,default='ffa')
+parser.add_argument('--logs_dir', type=str, default='./logs')
+parser.add_argument('--trainset', type=str,default='NH_train')
+parser.add_argument('--testset', type=str,default='NH_test')
+parser.add_argument('--net', type=str,default='cdnet')
+parser.add_argument('--h5_root', type=str, default='/home/why/datasets/h5/')
+parser.add_argument('--nh_png_root', type=str, default='/home/23uec549/btp/NH-HAZE/')
 
 parser.add_argument('--bs', type=int,default=16,help='batch size')
 parser.add_argument('--crop', action='store_true')
@@ -66,7 +70,8 @@ else:
 	opt.model_name = 'ots_train_ffa_3_19_pretrain'
 
 opt.model_dir=opt.model_dir + opt.model_name + '.pk'
-log_dir='logs/'+opt.model_name if not opt.transfer else 'logs/'+opt.model_name+'_transfer_' + opt.model_info
+transfer_info = getattr(opt, 'model_info', 'default')
+log_dir = os.path.join(opt.logs_dir, opt.model_name) if not opt.transfer else os.path.join(opt.logs_dir, opt.model_name + '_transfer_' + transfer_info)
 
 print(opt)
 print('model_dir:',opt.model_dir)
@@ -77,8 +82,8 @@ if not os.path.exists('trained_models'):
 	os.mkdir('trained_models')
 if not os.path.exists('numpy_files'):
 	os.mkdir('numpy_files')
-if not os.path.exists('logs'):
-	os.mkdir('logs')
+if not os.path.exists(opt.logs_dir):
+	os.mkdir(opt.logs_dir)
 if not os.path.exists('samples'):
 	os.mkdir('samples')
 if not os.path.exists(f"samples/{opt.model_name}"):

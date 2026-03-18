@@ -3,8 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
 import functools
-from deconv import FastDeconv
-from DCNv2.dcn_v2 import DCN
+try:
+    from .deconv import FastDeconv
+    from .DCNv2.dcn_v2 import DCN
+except ImportError:
+    # Fallback for legacy script execution styles.
+    from deconv import FastDeconv
+    from DCNv2.dcn_v2 import DCN
 
 
 def default_conv(in_channels, out_channels, kernel_size, bias=True):
@@ -65,7 +70,7 @@ class DehazeBlock(nn.Module):
 class DCNBlock(nn.Module):
     def __init__(self, in_channel, out_channel):
         super(DCNBlock, self).__init__()
-        self.dcn = DCN(in_channel, out_channel, kernel_size=(3,3), stride=1, padding=1).cuda()
+        self.dcn = DCN(in_channel, out_channel, kernel_size=(3,3), stride=1, padding=1)
     def forward(self, x):
         return self.dcn(x)
 

@@ -38,15 +38,20 @@ class Vgg19(torch.nn.Module):
         return [h_relu1, h_relu2, h_relu3, h_relu4, h_relu5]
 
 class ContrastLoss(nn.Module):
-    def __init__(self, ablation=False):
+    def __init__(self, ablation=False, force_legacy_cuda=False):
 
         super(ContrastLoss, self).__init__()
-        self.vgg = Vgg19().cuda()
+        self.vgg = Vgg19()
+        self.force_legacy_cuda = force_legacy_cuda
+        if self.force_legacy_cuda:
+            self.vgg = self.vgg.cuda()
         self.l1 = nn.L1Loss()
         self.weights = [1.0/32, 1.0/16, 1.0/8, 1.0/4, 1.0]
         self.ab = ablation
 
     def forward(self, a, p, n):
+        if not self.force_legacy_cuda:
+            self.vgg = self.vgg.to(a.device)
         a_vgg, p_vgg, n_vgg = self.vgg(a), self.vgg(p), self.vgg(n)
         loss = 0
 
